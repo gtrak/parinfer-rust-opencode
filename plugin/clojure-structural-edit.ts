@@ -22,8 +22,8 @@
 // into when bracket-counting Clojure code.
 
 import type { Plugin } from "@opencode-ai/plugin"
-import { spawn, spawnSync } from "node:child_process"
-import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs"
+import { spawnSync } from "node:child_process"
+import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync } from "node:fs"
 import { dirname, extname, isAbsolute, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -255,28 +255,40 @@ export default (async () => {
         }
       }
 
-      // Parinfer couldn't fix it. Revert.
+      // Parinfer couldn't fix it (or its result still fails verification).
+      // Revert and emit a banner that distinguishes the two cases, since they
+      // mean very different things:
+      //   - !fix.ok           : parinfer hit a hard problem (e.g. unterminated
+      //                          string, reader-macro error). Real structural bug.
+      //   - fix.ok && !recheck.ok : parinfer accepted the file but the verifier
+      //                          still rejects. Either the verifier is buggy or
+      //                          the file has issues outside parinfer's scope.
       let reverted = false
       if (existed && prevContent !== null) {
         reverted = writeSafe(filePath, prevContent)
       } else if (!existed) {
-        // We created a new broken file — try to delete it.
         try {
-          // node:fs unlink — best effort
-          // eslint-disable-next-line @typescript-eslint/no-var-requires
-          require("node:fs").unlinkSync(filePath)
+          unlinkSync(filePath)
           reverted = true
         } catch { reverted = false }
       }
 
       const failures = bumpFailure(filePath)
-      const parinferDetail = fix.ok
-        ? `parinfer ran but the result still does not parse`
+      const verifierDisagrees = fix.ok
+      const bannerTitle = verifierDisagrees
+        ? "EDIT REVERTED (verifier rejected parinfer's result)"
+        : "EDIT REVERTED"
+      const parinferDetail = verifierDisagrees
+        ? `parinfer-rust modified the file successfully, but the parse-check ` +
+          `re-verifier still rejects it. This may indicate a verifier ` +
+          `false-negative — inspect the file manually.`
         : `parinfer-rust failed: ${fix.error || "(no detail)"}`
 
       const msg =
-        `Your edit to ${filePath} produced an unparseable file and ` +
-        `parinfer-rust could not repair it.\n\n` +
+        `Your edit to ${filePath} produced an unparseable file ` +
+        (verifierDisagrees
+          ? `and parinfer-rust's repair was rejected by the verifier.\n\n`
+          : `and parinfer-rust could not repair it.\n\n`) +
         `Reader error:\n${post.error || "(no detail)"}\n\n` +
         `${parinferDetail}\n\n` +
         (reverted
@@ -291,7 +303,7 @@ export default (async () => {
           ? `Threshold reached — further edits will be rejected.`
           : `One more and edits will be rejected.`)
 
-      output.output = (output.output ?? "") + banner("EDIT REVERTED", msg)
+      output.output = (output.output ?? "") + banner(bannerTitle, msg)
     },
   }
 }) satisfies Plugin

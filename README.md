@@ -36,7 +36,7 @@ skill/scripts/clj-parinfer-fix.sh   parinfer-rust wrapper (in-place fix)
 
 - [opencode](https://opencode.ai) 1.4 or later (for the plugin hook surface).
 - [`parinfer-rust`](https://github.com/eraserhd/parinfer-rust) on `PATH`.
-  Install with `cargo install parinfer-rust`.
+  Install with `cargo install --git https://github.com/eraserhd/parinfer-rust`.
 - One of:
   - [`bb`](https://babashka.org) (babashka) — preferred, fast startup.
   - The Clojure CLI (`clojure`) — fallback.
@@ -150,7 +150,7 @@ Constants you can tweak by editing `plugin/clojure-structural-edit.ts`:
 
 ## Why this exists
 
-I lost an afternoon watching a small local model bisect a Clojure file by
+I lost too much time watching a small local model bisect a Clojure file by
 running `tr -cd '(' | wc -c` over and over again, getting more confused with
 each iteration, while the file got progressively more broken. Each "fix" was
 applied on top of a still-broken state, the LSP errors moved further from

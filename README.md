@@ -40,9 +40,8 @@ skill/scripts/clj-parinfer-fix.sh   parinfer-rust in-place fix (manual recovery)
 - [`parinfer-rust`](https://github.com/eraserhd/parinfer-rust) on `PATH`.
   Install with `cargo install --git https://github.com/eraserhd/parinfer-rust`.
 
-That's it. No JVM, no babashka, no Clojure CLI. The plugin shells out to
-`parinfer-rust` once per edit and parses its JSON output for both
-verification and repair.
+That's it. The plugin shells out to `parinfer-rust` once per edit and parses 
+its JSON output for both verification and repair.
 
 The plugin itself is plain TypeScript with no runtime dependencies; opencode
 loads `.ts` plugins natively via Bun. (The two recovery scripts under

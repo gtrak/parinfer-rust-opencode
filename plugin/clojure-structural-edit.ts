@@ -3,29 +3,34 @@
 // Enforces structural integrity of Clojure / EDN / Lisp-family files
 // across `write`, `edit`, and `hashedit` tool calls.
 //
-// Hook surface (opencode 1.4.x):
-//   - tool.execute.before  : snapshot file content + record pre-edit health
-//   - tool.execute.after   : parse-check the result; auto-fix with
-//                            parinfer-rust; revert from snapshot if the
-//                            agent's edit cannot be made to parse.
+// Single dependency: `parinfer-rust` on PATH.
 //
-// The plugin observes; it cannot truly block a tool call. So instead of
-// blocking, it lets the edit happen, then checks the result and either
-// (a) accepts cleanly, (b) auto-fixes via parinfer-rust and warns, or
-// (c) reverts the file and warns loudly. The warning text is appended to
-// the tool's `output.output` so the agent sees it in-band.
+// `parinfer-rust` does double duty here:
+//   - Fixer:    if the input has fixable bracket imbalance, parinfer's
+//               output is the corrected text.
+//   - Verifier: parinfer's parser is a Clojure-aware s-expression parser.
+//               If `success: false`, the file has a real structural
+//               problem (unterminated string, reader-macro error, etc.)
+//               that parinfer cannot rebalance.
+//
+// Hook surface (opencode 1.4.x):
+//   - tool.execute.before  : snapshot pre-edit content + health
+//   - tool.execute.after   : analyse the post-edit content via parinfer;
+//                            silently accept, auto-fix and warn, or revert
+//                            from snapshot and warn loudly.
+//
+// The plugin observes; opencode 1.4 cannot truly block a tool call. The
+// edit hits disk, then the plugin reacts. Banners are appended to the
+// tool's `output.output` so the agent sees them in-band.
 //
 // Loop-breaker: after N consecutive auto-fix-or-revert events on the same
-// file in the same session, the plugin starts rejecting (via revert +
-// warn) all further edits to that file until the user intervenes. This
-// stops the "fix on top of broken" doom loop that smaller models fall
-// into when bracket-counting Clojure code.
+// file, the plugin rejects further edits to that file by reverting and
+// emitting `EDIT REJECTED (loop-breaker)`. A clean edit resets the count.
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { spawnSync } from "node:child_process"
 import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync } from "node:fs"
-import { dirname, extname, isAbsolute, resolve } from "node:path"
-import { fileURLToPath } from "node:url"
+import { extname, isAbsolute, resolve } from "node:path"
 
 // ---------------------------------------------------------------------------
 // Config
@@ -36,44 +41,16 @@ const CLOJURE_EXTENSIONS = new Set([
 
 const TARGET_TOOLS = new Set(["write", "edit", "hashedit"])
 
-const PARINFER_MODE = "smart" as "smart" | "paren" | "indent"
+// "smart" rebalances by indentation hints when present, falls back to
+// paren-mode reasoning otherwise. "paren" is more conservative but
+// loses indentation guidance. "indent" only works on already-managed files.
+const PARINFER_MODE: "smart" | "paren" | "indent" = "smart"
 
-// After this many consecutive auto-fix or revert events on the same file,
-// further edits to that file are reverted unconditionally and the agent is
-// told to stop and ask the user.
+// Path to the parinfer-rust binary. Override with PARINFER_RUST_BIN env var.
+const PARINFER_BIN = process.env.PARINFER_RUST_BIN ?? "parinfer-rust"
+
+// Consecutive failures threshold before the loop-breaker engages.
 const MAX_CONSECUTIVE_FAILURES = 2
-
-// Resolve bundled scripts. Tried in order:
-//   1. PARINFER_OPENCODE_SCRIPTS env var (explicit override)
-//   2. ../skill/scripts          (this repo's layout)
-//   3. ./scripts                  (scripts colocated with the plugin file)
-//   4. ../skills/clojure-parinfer/scripts (legacy layout)
-//   5. ~/.config/opencode/skills/clojure-parinfer/scripts (user-installed)
-// If none exist the plugin warns at load and becomes a no-op.
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = dirname(__filename)
-
-function findScriptsDir(): string {
-  const home = process.env.HOME ?? ""
-  const candidates = [
-    process.env.PARINFER_OPENCODE_SCRIPTS,
-    resolve(__dirname, "..", "skill", "scripts"),
-    resolve(__dirname, "scripts"),
-    resolve(__dirname, "..", "skills", "clojure-parinfer", "scripts"),
-    home && resolve(home, ".config", "opencode", "skills", "clojure-parinfer", "scripts"),
-  ].filter((p): p is string => typeof p === "string" && p.length > 0)
-  for (const c of candidates) {
-    try {
-      if (statSync(resolve(c, "clj-parse-check.sh")).isFile()) return c
-    } catch { /* try next */ }
-  }
-  // Return the first non-env candidate so error messages are useful.
-  return resolve(__dirname, "..", "skill", "scripts")
-}
-
-const SCRIPTS_DIR = findScriptsDir()
-const PARSE_CHECK = resolve(SCRIPTS_DIR, "clj-parse-check.sh")
-const PARINFER_FIX = resolve(SCRIPTS_DIR, "clj-parinfer-fix.sh")
 
 // ---------------------------------------------------------------------------
 // State
@@ -88,8 +65,7 @@ type Snapshot = {
 // Keyed by callID — opencode passes the same callID to before/after.
 const snapshots = new Map<string, Snapshot>()
 
-// Per-file failure counter, keyed by absolute path. Lives for the
-// process lifetime (one opencode session).
+// Per-file failure counter, keyed by absolute path.
 const failureCounts = new Map<string, number>()
 
 // ---------------------------------------------------------------------------
@@ -97,13 +73,11 @@ const failureCounts = new Map<string, number>()
 
 function isClojureFile(p: string): boolean {
   if (!p) return false
-  const ext = extname(p).toLowerCase()
-  return CLOJURE_EXTENSIONS.has(ext)
+  return CLOJURE_EXTENSIONS.has(extname(p).toLowerCase())
 }
 
-function extractFilePath(tool: string, args: any): string | null {
+function extractFilePath(_tool: string, args: any): string | null {
   if (!args || typeof args !== "object") return null
-  // All three target tools use `filePath`.
   const fp = (args as { filePath?: unknown }).filePath
   if (typeof fp !== "string" || fp.length === 0) return null
   return isAbsolute(fp) ? fp : resolve(process.cwd(), fp)
@@ -119,26 +93,6 @@ function writeSafe(path: string, content: string): boolean {
 
 function exists(path: string): boolean {
   try { return statSync(path).isFile() } catch { return false }
-}
-
-function runScript(script: string, args: string[], timeoutMs = 8000):
-  { ok: boolean; stdout: string; stderr: string } {
-  const r = spawnSync(script, args, { encoding: "utf8", timeout: timeoutMs })
-  return {
-    ok: r.status === 0,
-    stdout: (r.stdout ?? "").toString(),
-    stderr: (r.stderr ?? "").toString(),
-  }
-}
-
-function parseCheck(path: string): { ok: boolean; error: string } {
-  const r = runScript(PARSE_CHECK, [path])
-  return { ok: r.ok, error: r.stderr.trim() || r.stdout.trim() }
-}
-
-function parinferFix(path: string): { ok: boolean; error: string } {
-  const r = runScript(PARINFER_FIX, [path, PARINFER_MODE])
-  return { ok: r.ok, error: r.stderr.trim() || r.stdout.trim() }
 }
 
 function bumpFailure(path: string): number {
@@ -157,14 +111,87 @@ function banner(title: string, body: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// parinfer-rust JSON IO
+//
+// Single source of truth for both verification and repair. Parinfer's JSON
+// output tells us whether the input was structurally valid (`success`),
+// and if so, what the canonical balanced form is (`text`).
+
+type ParinferResult =
+  | { kind: "clean" }                          // input parsed; no changes needed
+  | { kind: "fixed"; corrected: string }       // input parsed; parinfer rebalanced it
+  | { kind: "unfixable"; error: string }       // input has an error parinfer cannot repair
+
+type ParinferRawResult = {
+  text: string
+  success: boolean
+  error: null | {
+    name: string
+    message: string
+    lineNo?: number
+    x?: number
+  }
+}
+
+function parinferAnalyze(input: string): ParinferResult {
+  const payload = JSON.stringify({
+    text: input,
+    mode: PARINFER_MODE,
+    options: {},
+  })
+
+  const r = spawnSync(
+    PARINFER_BIN,
+    ["--input-format=json", "--output-format=json"],
+    { input: payload, encoding: "utf8", timeout: 8000 },
+  )
+
+  if (r.error || r.status !== 0) {
+    // parinfer-rust missing, crashed, or refused the input. Treat as
+    // unfixable so the plugin reverts; surface stderr for debugging.
+    const detail = (r.stderr ?? "").toString().trim() ||
+      (r.error?.message ?? "parinfer-rust exited non-zero")
+    return { kind: "unfixable", error: `parinfer-rust invocation failed: ${detail}` }
+  }
+
+  let parsed: ParinferRawResult
+  try {
+    parsed = JSON.parse(r.stdout)
+  } catch (e) {
+    return {
+      kind: "unfixable",
+      error: `parinfer-rust returned non-JSON output: ${(e as Error).message}`,
+    }
+  }
+
+  if (!parsed.success) {
+    const err = parsed.error
+    const loc = err && typeof err.lineNo === "number"
+      ? ` [line ${err.lineNo + 1}, col ${(err.x ?? 0) + 1}]`
+      : ""
+    const msg = err ? `${err.name}: ${err.message}${loc}` : "(no detail)"
+    return { kind: "unfixable", error: msg }
+  }
+
+  return parsed.text === input
+    ? { kind: "clean" }
+    : { kind: "fixed", corrected: parsed.text }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 
 export default (async () => {
-  // Verify scripts exist at load time and warn loudly if not.
-  if (!exists(PARSE_CHECK) || !exists(PARINFER_FIX)) {
+  // Probe parinfer-rust at load time and warn loudly if missing. We don't
+  // disable the plugin — a clear runtime banner is more useful than silent
+  // no-op behavior, since the agent will read the banner and react.
+  const probe = spawnSync(PARINFER_BIN, ["--help"], { timeout: 4000 })
+  if (probe.error || probe.status !== 0) {
     console.warn(
-      `[clojure-structural-edit] missing helper scripts under ${SCRIPTS_DIR}; ` +
-      `plugin will be a no-op. Expected:\n  ${PARSE_CHECK}\n  ${PARINFER_FIX}`,
+      `[clojure-structural-edit] cannot find parinfer-rust binary "${PARINFER_BIN}". ` +
+      `Install with \`cargo install parinfer-rust\` or set PARINFER_RUST_BIN. ` +
+      `Until then every Clojure edit will be reverted with a "parinfer-rust ` +
+      `invocation failed" banner.`,
     )
   }
 
@@ -178,8 +205,8 @@ export default (async () => {
       const prevContent = existed ? readSafe(filePath) : null
       const prevWasHealthy =
         existed && prevContent !== null
-          ? parseCheck(filePath).ok
-          : true // new files are trivially healthy
+          ? parinferAnalyze(prevContent).kind !== "unfixable"
+          : true
 
       snapshots.set(input.callID, {
         filePath,
@@ -197,15 +224,16 @@ export default (async () => {
 
       const { filePath, existed, prevContent, prevWasHealthy } = snap
 
-      // If the edit deleted the file, nothing structural to do.
+      // The edit may have deleted the file; nothing structural to do.
       if (!exists(filePath)) return
 
-      // Parse-check the result of the edit FIRST. If it parses, accept
-      // and reset the failure counter — even if this file was previously
-      // at the threshold. A successful edit unlocks the file.
-      const post = parseCheck(filePath)
+      const current = readSafe(filePath)
+      if (current === null) return
 
-      if (post.ok) {
+      const result = parinferAnalyze(current)
+
+      // ----- Case 1: clean parse, file is balanced. ---------------------
+      if (result.kind === "clean") {
         if (!prevWasHealthy) {
           output.output = (output.output ?? "") + banner(
             "PRE-EXISTING BREAKAGE FIXED",
@@ -216,94 +244,110 @@ export default (async () => {
         return
       }
 
-      // Edit produced unparseable output. Apply loop-breaker BEFORE
-      // attempting parinfer if this file has already hit the threshold:
-      // we don't want to keep auto-fixing on a clearly stuck file.
-      const priorFailures = failureCounts.get(filePath) ?? 0
-      if (priorFailures >= MAX_CONSECUTIVE_FAILURES) {
-        if (existed && prevContent !== null) writeSafe(filePath, prevContent)
+      // ----- Case 2: parinfer rebalanced. Write the corrected text. ----
+      if (result.kind === "fixed") {
+        // If we're already at the threshold, even a fixable edit is a
+        // signal that the agent is thrashing. Engage the loop-breaker.
+        const priorFailures = failureCounts.get(filePath) ?? 0
+        if (priorFailures >= MAX_CONSECUTIVE_FAILURES) {
+          revertAndReject(filePath, existed, prevContent, output, priorFailures,
+            "edit was fixable but file is at the failure threshold")
+          return
+        }
+
+        const wrote = writeSafe(filePath, result.corrected)
+        if (!wrote) {
+          // Couldn't write the correction; treat as unfixable.
+          handleUnfixable(filePath, existed, prevContent, output,
+            `parinfer corrected the file but the corrected content could not be written to disk`)
+          return
+        }
+        const failures = bumpFailure(filePath)
         const msg =
-          `Edits to ${filePath} have failed ${priorFailures} consecutive ` +
-          `times and this edit also failed to parse. Plugin is rejecting ` +
-          `further edits to this file for this session.\n\n` +
-          `STOP. Do not retry. Ask the user how to proceed.\n` +
-          `Suggested user actions:\n` +
-          `  1. git diff HEAD -- "${filePath}" — see what changed\n` +
-          `  2. git checkout -- "${filePath}" — reset to last committed\n` +
-          `  3. parinfer-rust --mode paren < "${filePath}" — manual fix`
-        output.output = (output.output ?? "") + banner("EDIT REJECTED (loop-breaker)", msg)
+          `Your edit to ${filePath} produced an unbalanced file. ` +
+          `parinfer-rust (${PARINFER_MODE} mode) rebalanced it automatically.\n\n` +
+          `REVIEW THE DIFF. Parinfer's correction may not match your intent. ` +
+          `Run \`git diff -- "${filePath}"\` and verify.\n\n` +
+          `Consecutive structural failures on this file: ${failures}/${MAX_CONSECUTIVE_FAILURES}. ` +
+          (failures >= MAX_CONSECUTIVE_FAILURES
+            ? `Threshold reached — further edits will be rejected.`
+            : `One more and edits will be rejected.`)
+        output.output = (output.output ?? "") + banner("AUTO-FIXED via parinfer-rust", msg)
         return
       }
 
-      // Edit produced unparseable output. Try parinfer auto-fix.
-      const fix = parinferFix(filePath)
-      if (fix.ok) {
-        const recheck = parseCheck(filePath)
-        if (recheck.ok) {
-          const failures = bumpFailure(filePath)
-          const msg =
-            `Your edit to ${filePath} produced an unparseable file. ` +
-            `parinfer-rust (${PARINFER_MODE} mode) corrected the structure ` +
-            `automatically.\n\n` +
-            `Reader error before fix:\n${post.error || "(no detail)"}\n\n` +
-            `REVIEW THE DIFF. Parinfer's correction may not match your ` +
-            `intent. Run \`git diff -- "${filePath}"\` and verify.\n\n` +
-            `Consecutive structural failures on this file: ${failures}/${MAX_CONSECUTIVE_FAILURES}. ` +
-            `One more and edits will be rejected.`
-          output.output = (output.output ?? "") + banner("AUTO-FIXED via parinfer-rust", msg)
-          return
-        }
+      // ----- Case 3: parinfer reports a structural error it can't fix. -
+      //
+      // Loop-breaker check first: if we're already at the threshold, the
+      // banner says "rejected" rather than "reverted" so the agent knows
+      // to stop trying.
+      const priorFailures = failureCounts.get(filePath) ?? 0
+      if (priorFailures >= MAX_CONSECUTIVE_FAILURES) {
+        revertAndReject(filePath, existed, prevContent, output, priorFailures,
+          result.error)
+        return
       }
-
-      // Parinfer couldn't fix it (or its result still fails verification).
-      // Revert and emit a banner that distinguishes the two cases, since they
-      // mean very different things:
-      //   - !fix.ok           : parinfer hit a hard problem (e.g. unterminated
-      //                          string, reader-macro error). Real structural bug.
-      //   - fix.ok && !recheck.ok : parinfer accepted the file but the verifier
-      //                          still rejects. Either the verifier is buggy or
-      //                          the file has issues outside parinfer's scope.
-      let reverted = false
-      if (existed && prevContent !== null) {
-        reverted = writeSafe(filePath, prevContent)
-      } else if (!existed) {
-        try {
-          unlinkSync(filePath)
-          reverted = true
-        } catch { reverted = false }
-      }
-
-      const failures = bumpFailure(filePath)
-      const verifierDisagrees = fix.ok
-      const bannerTitle = verifierDisagrees
-        ? "EDIT REVERTED (verifier rejected parinfer's result)"
-        : "EDIT REVERTED"
-      const parinferDetail = verifierDisagrees
-        ? `parinfer-rust modified the file successfully, but the parse-check ` +
-          `re-verifier still rejects it. This may indicate a verifier ` +
-          `false-negative — inspect the file manually.`
-        : `parinfer-rust failed: ${fix.error || "(no detail)"}`
-
-      const msg =
-        `Your edit to ${filePath} produced an unparseable file ` +
-        (verifierDisagrees
-          ? `and parinfer-rust's repair was rejected by the verifier.\n\n`
-          : `and parinfer-rust could not repair it.\n\n`) +
-        `Reader error:\n${post.error || "(no detail)"}\n\n` +
-        `${parinferDetail}\n\n` +
-        (reverted
-          ? `The file has been REVERTED to its pre-edit state.`
-          : `WARNING: revert FAILED. The file is in a broken state on disk.`) +
-        `\n\nDo NOT retry the same edit. Required next steps:\n` +
-        `  1. Read the file — confirm what is actually there now\n` +
-        `  2. If the structural change is large, replace the WHOLE top-level form, not a slice\n` +
-        `  3. After editing, this plugin will re-check; do not paren-count by hand\n\n` +
-        `Consecutive structural failures on this file: ${failures}/${MAX_CONSECUTIVE_FAILURES}. ` +
-        (failures >= MAX_CONSECUTIVE_FAILURES
-          ? `Threshold reached — further edits will be rejected.`
-          : `One more and edits will be rejected.`)
-
-      output.output = (output.output ?? "") + banner(bannerTitle, msg)
+      handleUnfixable(filePath, existed, prevContent, output, result.error)
     },
   }
 }) satisfies Plugin
+
+// ---------------------------------------------------------------------------
+// Banner helpers
+
+function revertSafely(filePath: string, existed: boolean, prevContent: string | null): boolean {
+  if (existed && prevContent !== null) return writeSafe(filePath, prevContent)
+  if (!existed) {
+    try { unlinkSync(filePath); return true } catch { return false }
+  }
+  return false
+}
+
+function handleUnfixable(
+  filePath: string,
+  existed: boolean,
+  prevContent: string | null,
+  output: { output: string },
+  parinferError: string,
+): void {
+  const reverted = revertSafely(filePath, existed, prevContent)
+  const failures = bumpFailure(filePath)
+  const msg =
+    `Your edit to ${filePath} produced an unparseable file and ` +
+    `parinfer-rust could not repair it.\n\n` +
+    `Parser error: ${parinferError}\n\n` +
+    (reverted
+      ? `The file has been REVERTED to its pre-edit state.`
+      : `WARNING: revert FAILED. The file is in a broken state on disk.`) +
+    `\n\nDo NOT retry the same edit. Required next steps:\n` +
+    `  1. Read the file — confirm what is actually there now\n` +
+    `  2. If the structural change is large, replace the WHOLE top-level form, not a slice\n` +
+    `  3. Errors like "unclosed-quote" or "unmatched-close-paren" inside ` +
+       `strings or reader macros are NOT bracket-balance issues — fix them by hand\n\n` +
+    `Consecutive structural failures on this file: ${failures}/${MAX_CONSECUTIVE_FAILURES}. ` +
+    (failures >= MAX_CONSECUTIVE_FAILURES
+      ? `Threshold reached — further edits will be rejected.`
+      : `One more and edits will be rejected.`)
+  output.output = (output.output ?? "") + banner("EDIT REVERTED", msg)
+}
+
+function revertAndReject(
+  filePath: string,
+  existed: boolean,
+  prevContent: string | null,
+  output: { output: string },
+  priorFailures: number,
+  reason: string,
+): void {
+  revertSafely(filePath, existed, prevContent)
+  const msg =
+    `Edits to ${filePath} have failed ${priorFailures} consecutive times ` +
+    `and this edit also failed (${reason}). The plugin is rejecting ` +
+    `further edits to this file for this session.\n\n` +
+    `STOP. Do not retry. Ask the user how to proceed.\n` +
+    `Suggested user actions:\n` +
+    `  1. git diff HEAD -- "${filePath}" — see what changed\n` +
+    `  2. git checkout -- "${filePath}" — reset to last committed\n` +
+    `  3. parinfer-rust --mode paren < "${filePath}" — manual fix attempt`
+  output.output = (output.output ?? "") + banner("EDIT REJECTED (loop-breaker)", msg)
+}

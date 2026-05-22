@@ -1,0 +1,10 @@
+node_modules/
+bun.lock
+bun.lockb
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+.opencode/
+opencode-notifier-state.json
+*.log
+.DS_Store

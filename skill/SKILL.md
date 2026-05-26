@@ -21,18 +21,13 @@ catches violations.
 ## What the plugin does on your behalf
 
 After every edit the plugin runs the result through `parinfer-rust`, which
-serves as both verifier and fixer. There are exactly four outcomes:
-
+serves as both verifier and fixer. There are exactly three outcomes:
 | Banner                                          | What happened                                       | What you do                                         |
 |-------------------------------------------------|-----------------------------------------------------|-----------------------------------------------------|
 | (silent)                                        | Edit produced a balanced file. Nothing to do.       | Continue.                                           |
 | `AUTO-FIXED via parinfer-rust`                  | File was imbalanced; parinfer rebalanced it on disk. | Run `git diff` to confirm parinfer's repair matches your intent. |
 | `EDIT REVERTED`                                 | Parinfer reported a structural error it cannot fix (unterminated string, malformed reader macro, etc.). File rolled back to pre-edit state. | Read the file. Replace the whole top-level form. Do **not** retry the same edit. |
-| `EDIT REJECTED (loop-breaker)`                  | Two consecutive failures on this file. Plugin is now refusing further edits to it for the session. | **Stop. Ask the user.** Do not retry. |
 | `PRE-EXISTING BREAKAGE FIXED`                   | The file had an unfixable structural error before your edit, and your edit cleared it. | Continue. |
-
-The plugin maintains a per-file failure counter. A successful edit resets
-it; the third consecutive failure on the same file engages the loop-breaker.
 
 ## Hard prohibitions
 
@@ -53,10 +48,8 @@ These apply to your behavior; the plugin enforces some of them but not all.
 - **Never edit a file the plugin says is broken.** Fix-on-top-of-broken
   makes things worse. If the plugin reverted your last edit, do not try a
   variation of the same edit; investigate first.
-- **Never silently retry a failed structural edit.** The plugin will
-  reject the third attempt anyway; do the user the courtesy of stopping
-  at one and asking what they meant.
-
+- **Never silently retry a failed structural edit.** If the plugin reverted
+  your last edit, investigate what's wrong first. Ask the user if unsure.
 ## Edit pipeline
 
 For any edit to a Lisp file:
@@ -76,8 +69,7 @@ work.
 
 ## Recovery: when an edit was reverted
 
-You only reach this flow when the plugin has emitted `EDIT REVERTED` or
-`EDIT REJECTED (loop-breaker)`.
+You only reach this flow when the plugin has emitted `EDIT REVERTED`.
 
 1. **Look at the diff first**, not the file:
    ```
@@ -99,10 +91,6 @@ You only reach this flow when the plugin has emitted `EDIT REVERTED` or
    (`unclosed-quote`, malformed `#?(...)`, etc.), parinfer cannot help.
    The bug is almost always a stray `"` or a typo in a reader form. Fix
    it manually with a whole-form replacement.
-5. **If you saw `EDIT REJECTED (loop-breaker)`**, stop. Ask the user.
-   The file has failed enough times that further automated attempts are
-   counterproductive.
-
 ## Reader-error triage cheat sheet
 
 If you do see a reader error directly (e.g. from kondo, or from running

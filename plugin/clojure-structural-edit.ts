@@ -23,13 +23,9 @@
 // edit hits disk, then the plugin reacts. Banners are appended to the
 // tool's `output.output` so the agent sees them in-band.
 //
-// Loop-breaker: after N consecutive auto-fix-or-revert events on the same
-// file, the plugin rejects further edits to that file by reverting and
-// emitting `EDIT REJECTED (loop-breaker)`. A clean edit resets the count.
-
 import type { Plugin } from "@opencode-ai/plugin"
 import { spawnSync } from "node:child_process"
-import { readFileSync, writeFileSync, existsSync, statSync, unlinkSync } from "node:fs"
+import { readFileSync, writeFileSync, statSync, unlinkSync } from "node:fs"
 import { extname, isAbsolute, resolve } from "node:path"
 
 // ---------------------------------------------------------------------------
@@ -49,9 +45,6 @@ const PARINFER_MODE: "smart" | "paren" | "indent" = "smart"
 // Path to the parinfer-rust binary. Override with PARINFER_RUST_BIN env var.
 const PARINFER_BIN = process.env.PARINFER_RUST_BIN ?? "parinfer-rust"
 
-// Consecutive failures threshold before the loop-breaker engages.
-const MAX_CONSECUTIVE_FAILURES = 2
-
 // ---------------------------------------------------------------------------
 // State
 
@@ -64,9 +57,6 @@ type Snapshot = {
 
 // Keyed by callID — opencode passes the same callID to before/after.
 const snapshots = new Map<string, Snapshot>()
-
-// Per-file failure counter, keyed by absolute path.
-const failureCounts = new Map<string, number>()
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -93,16 +83,6 @@ function writeSafe(path: string, content: string): boolean {
 
 function exists(path: string): boolean {
   try { return statSync(path).isFile() } catch { return false }
-}
-
-function bumpFailure(path: string): number {
-  const n = (failureCounts.get(path) ?? 0) + 1
-  failureCounts.set(path, n)
-  return n
-}
-
-function resetFailure(path: string): void {
-  failureCounts.delete(path)
 }
 
 function banner(title: string, body: string): string {
@@ -240,21 +220,11 @@ export default (async () => {
             `${filePath} was malformed before this edit and now parses cleanly. Good.`,
           )
         }
-        resetFailure(filePath)
         return
       }
 
       // ----- Case 2: parinfer rebalanced. Write the corrected text. ----
       if (result.kind === "fixed") {
-        // If we're already at the threshold, even a fixable edit is a
-        // signal that the agent is thrashing. Engage the loop-breaker.
-        const priorFailures = failureCounts.get(filePath) ?? 0
-        if (priorFailures >= MAX_CONSECUTIVE_FAILURES) {
-          revertAndReject(filePath, existed, prevContent, output, priorFailures,
-            "edit was fixable but file is at the failure threshold")
-          return
-        }
-
         const wrote = writeSafe(filePath, result.corrected)
         if (!wrote) {
           // Couldn't write the correction; treat as unfixable.
@@ -262,31 +232,16 @@ export default (async () => {
             `parinfer corrected the file but the corrected content could not be written to disk`)
           return
         }
-        const failures = bumpFailure(filePath)
         const msg =
           `Your edit to ${filePath} produced an unbalanced file. ` +
           `parinfer-rust (${PARINFER_MODE} mode) rebalanced it automatically.\n\n` +
           `REVIEW THE DIFF. Parinfer's correction may not match your intent. ` +
-          `Run \`git diff -- "${filePath}"\` and verify.\n\n` +
-          `Consecutive structural failures on this file: ${failures}/${MAX_CONSECUTIVE_FAILURES}. ` +
-          (failures >= MAX_CONSECUTIVE_FAILURES
-            ? `Threshold reached — further edits will be rejected.`
-            : `One more and edits will be rejected.`)
+          `Run \`git diff -- "${filePath}"\` and verify.`
         output.output = (output.output ?? "") + banner("AUTO-FIXED via parinfer-rust", msg)
         return
       }
 
       // ----- Case 3: parinfer reports a structural error it can't fix. -
-      //
-      // Loop-breaker check first: if we're already at the threshold, the
-      // banner says "rejected" rather than "reverted" so the agent knows
-      // to stop trying.
-      const priorFailures = failureCounts.get(filePath) ?? 0
-      if (priorFailures >= MAX_CONSECUTIVE_FAILURES) {
-        revertAndReject(filePath, existed, prevContent, output, priorFailures,
-          result.error)
-        return
-      }
       handleUnfixable(filePath, existed, prevContent, output, result.error)
     },
   }
@@ -311,7 +266,7 @@ function handleUnfixable(
   parinferError: string,
 ): void {
   const reverted = revertSafely(filePath, existed, prevContent)
-  const failures = bumpFailure(filePath)
+
   const msg =
     `Your edit to ${filePath} produced an unparseable file and ` +
     `parinfer-rust could not repair it.\n\n` +
@@ -323,31 +278,6 @@ function handleUnfixable(
     `  1. Read the file — confirm what is actually there now\n` +
     `  2. If the structural change is large, replace the WHOLE top-level form, not a slice\n` +
     `  3. Errors like "unclosed-quote" or "unmatched-close-paren" inside ` +
-       `strings or reader macros are NOT bracket-balance issues — fix them by hand\n\n` +
-    `Consecutive structural failures on this file: ${failures}/${MAX_CONSECUTIVE_FAILURES}. ` +
-    (failures >= MAX_CONSECUTIVE_FAILURES
-      ? `Threshold reached — further edits will be rejected.`
-      : `One more and edits will be rejected.`)
+       `strings or reader macros are NOT bracket-balance issues — fix them by hand`
   output.output = (output.output ?? "") + banner("EDIT REVERTED", msg)
-}
-
-function revertAndReject(
-  filePath: string,
-  existed: boolean,
-  prevContent: string | null,
-  output: { output: string },
-  priorFailures: number,
-  reason: string,
-): void {
-  revertSafely(filePath, existed, prevContent)
-  const msg =
-    `Edits to ${filePath} have failed ${priorFailures} consecutive times ` +
-    `and this edit also failed (${reason}). The plugin is rejecting ` +
-    `further edits to this file for this session.\n\n` +
-    `STOP. Do not retry. Ask the user how to proceed.\n` +
-    `Suggested user actions:\n` +
-    `  1. git diff HEAD -- "${filePath}" — see what changed\n` +
-    `  2. git checkout -- "${filePath}" — reset to last committed\n` +
-    `  3. parinfer-rust --mode paren < "${filePath}" — manual fix attempt`
-  output.output = (output.output ?? "") + banner("EDIT REJECTED (loop-breaker)", msg)
 }

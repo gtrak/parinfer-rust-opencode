@@ -18,10 +18,6 @@ file with a single check, run via [`parinfer-rust`](https://github.com/eraserhd/
    reader-macro problem, etc.), **revert the file from a pre-edit snapshot**
    and tell the agent — loudly — to stop and rethink.
 
-After two consecutive failures on the same file, further edits are
-**rejected** until a clean edit succeeds. This is the "loop-breaker" that
-prevents the doom spiral where each failed attempt makes the file worse.
-
 The plugin emits structured banners that get appended to the tool output
 the agent sees. The agent reads them in-band and adjusts.
 
@@ -115,14 +111,11 @@ startup.
 | Already balanced, file was previously unfixable               | nothing destructive                 | `PRE-EXISTING BREAKAGE FIXED`     |
 | Imbalanced but parinfer can rebalance                         | parinfer rewrites file in place     | `AUTO-FIXED via parinfer-rust`    |
 | Parinfer reports an error it can't fix (e.g. unclosed-quote)  | revert from pre-edit snapshot       | `EDIT REVERTED`                   |
-| Two consecutive failures on the same file                     | revert; further edits rejected      | `EDIT REJECTED (loop-breaker)`    |
-| First successful edit after lockout                           | counter resets, file unlocks        | (silent)                          |
 
 Banner text is appended to the tool's `output.output`, so the agent sees
 it inline in the tool result and can react.
 
 ## Configuration
-
 Environment variables:
 
 - `PARINFER_RUST_BIN` — override the path to the parinfer-rust binary
@@ -131,10 +124,8 @@ Environment variables:
 Constants you can tweak by editing `plugin/clojure-structural-edit.ts`:
 
 - `PARINFER_MODE` (default `"smart"`) — `"smart"`, `"paren"`, or `"indent"`.
-- `MAX_CONSECUTIVE_FAILURES` (default `2`) — how many bad edits before the
-  loop-breaker engages.
-- `CLOJURE_EXTENSIONS` — file extensions the plugin watches.
 - `TARGET_TOOLS` — which opencode tools the plugin intercepts.
+- `CLOJURE_EXTENSIONS` — file extensions the plugin watches.
 
 ## Caveats
 

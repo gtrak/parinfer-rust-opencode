@@ -24,10 +24,22 @@ After every edit the plugin runs the result through `parinfer-rust`, which
 serves as both verifier and fixer. There are exactly three outcomes:
 | Banner                                          | What happened                                       | What you do                                         |
 |-------------------------------------------------|-----------------------------------------------------|-----------------------------------------------------|
-| (silent)                                        | Edit produced a balanced file. Nothing to do.       | Continue.                                           |
+| (silent)                                        | Edit produced a structurally valid file. Check mode confirmed balance; no rewrite needed.   | Continue.                                           |
 | `AUTO-FIXED via parinfer-rust`                  | File was imbalanced; parinfer rebalanced it on disk. | Run `git diff` to confirm parinfer's repair matches your intent. |
 | `EDIT REVERTED`                                 | Parinfer reported a structural error it cannot fix (unterminated string, malformed reader macro, etc.). File rolled back to pre-edit state. | Read the file. Replace the whole top-level form. Do **not** retry the same edit. |
 | `PRE-EXISTING BREAKAGE FIXED`                   | The file had an unfixable structural error before your edit, and your edit cleared it. | Continue. |
+
+## Known issues and workarounds
+
+### cljfmt vs parinfer indentation conflict
+
+`cljfmt` (and Clojure community convention) indents `cond->` clauses to align with the initial expression's first argument column. This is valid and conventional Clojure, but parinfer's indent-based heuristics cannot distinguish `cond->` clauses from map continuations when they share the same indentation column.
+
+**Impact:** In older versions of this plugin (before the check-mode gate), editing a `cond->` form with a multi-line map literal could cause parinfer to move the map's closing `}` past subsequent clauses, silently corrupting runtime semantics.
+
+**Resolution:** The plugin now uses `check` mode as a gate. Balanced files are never rewritten. Only genuinely unbalanced files trigger smart-mode repair. If you are using an older parinfer-rust that lacks `check` mode, update to the latest version.
+
+**Manual workaround (if needed):** If you must use an older version, outdent `cond->` clauses by one column relative to the map keys so parinfer treats them as siblings rather than map continuations. Note that `cljfmt` will re-indent them on save, recreating the conflict.
 
 ## Hard prohibitions
 

@@ -93,13 +93,14 @@ function banner(title: string, body: string): string {
 // ---------------------------------------------------------------------------
 // parinfer-rust JSON IO
 //
-// Single source of truth for both verification and repair. Parinfer's JSON
-// output tells us whether the input was structurally valid (`success`),
-// and if so, what the canonical balanced form is (`text`).
+// Two-phase analysis: check mode verifies structural balance without
+// rewriting. Only genuinely unbalanced files are sent through smart
+// mode for repair. This prevents unnecessary rewrites of balanced
+// code (which caused the cond-> corruption bug).
 
 type ParinferResult =
-  | { kind: "clean" }                          // input parsed; no changes needed
-  | { kind: "fixed"; corrected: string }       // input parsed; parinfer rebalanced it
+  | { kind: "clean" }                          // structurally valid (check passed; no rewrite)
+  | { kind: "fixed"; corrected: string }       // check failed; smart mode rebalanced it
   | { kind: "unfixable"; error: string }       // input has an error parinfer cannot repair
 
 type ParinferRawResult = {
@@ -113,7 +114,46 @@ type ParinferRawResult = {
   }
 }
 
+function parinferCheck(input: string): { success: boolean; error?: string } {
+  const payload = JSON.stringify({
+    text: input,
+    mode: "check",
+    options: {},
+  })
+
+  const r = spawnSync(
+    PARINFER_BIN,
+    ["--input-format=json", "--output-format=json"],
+    { input: payload, encoding: "utf8", timeout: 8000 },
+  )
+
+  if (r.error || r.status !== 0) {
+    const detail = (r.stderr ?? "").toString().trim() ||
+      (r.error?.message ?? "parinfer-rust exited non-zero")
+    return { success: false, error: `parinfer-rust invocation failed: ${detail}` }
+  }
+
+  let parsed: ParinferRawResult
+  try {
+    parsed = JSON.parse(r.stdout)
+  } catch (e) {
+    return {
+      success: false,
+      error: `parinfer-rust returned non-JSON output: ${(e as Error).message}`,
+    }
+  }
+
+  return { success: parsed.success }
+}
+
 function parinferAnalyze(input: string): ParinferResult {
+  // Phase 1: Check if structurally valid (no rewrites needed)
+  const check = parinferCheck(input)
+  if (check.success) {
+    return { kind: "clean" }
+  }
+
+  // Phase 2: File is unbalanced — run smart mode to repair
   const payload = JSON.stringify({
     text: input,
     mode: PARINFER_MODE,

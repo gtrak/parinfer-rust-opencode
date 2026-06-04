@@ -3,21 +3,30 @@
 // Enforces structural integrity of Clojure / EDN / Lisp-family files
 // across `write`, `edit`, and `hashedit` tool calls.
 //
-// Single dependency: `parinfer-rust` on PATH.
+// Single dependency: `parinfer-rust` on PATH (upstream, no fork required).
 //
-// `parinfer-rust` does double duty here:
-//   - Fixer:    if the input has fixable bracket imbalance, parinfer's
-//               output is the corrected text.
-//   - Verifier: parinfer's parser is a Clojure-aware s-expression parser.
-//               If `success: false`, the file has a real structural
-//               problem (unterminated string, reader-macro error, etc.)
-//               that parinfer cannot rebalance.
+// Strategy: paren mode as the sole verifier.
+//
+//   Paren mode treats brackets as authoritative and adjusts indentation
+//   to match. It never adds, removes, or moves brackets. This means:
+//
+//   - If paren mode returns `success: false`, the file has a genuine
+//     structural error (unterminated string, unclosed paren, reader-macro
+//     problem) — the edit is reverted.
+//
+//   - If paren mode returns `success: true` with identical text, the file
+//     is balanced and indentation matches structure — silent pass.
+//
+//   - If paren mode returns `success: true` with different text, the
+//     brackets are balanced but indentation didn't match the bracket
+//     structure. Paren mode's corrected indentation is written to disk
+//     and a warning banner tells the agent to verify intent.
 //
 // Hook surface (opencode 1.4.x):
 //   - tool.execute.before  : snapshot pre-edit content + health
 //   - tool.execute.after   : analyse the post-edit content via parinfer;
-//                            silently accept, auto-fix and warn, or revert
-//                            from snapshot and warn loudly.
+//                            silently accept, write corrected indentation
+//                            and warn, or revert from snapshot.
 //
 // The plugin observes; opencode 1.4 cannot truly block a tool call. The
 // edit hits disk, then the plugin reacts. Banners are appended to the
@@ -36,11 +45,6 @@ const CLOJURE_EXTENSIONS = new Set([
 ])
 
 const TARGET_TOOLS = new Set(["write", "edit", "hashedit"])
-
-// "smart" rebalances by indentation hints when present, falls back to
-// paren-mode reasoning otherwise. "paren" is more conservative but
-// loses indentation guidance. "indent" only works on already-managed files.
-const PARINFER_MODE: "smart" | "paren" | "indent" = "smart"
 
 // Path to the parinfer-rust binary. Override with PARINFER_RUST_BIN env var.
 const PARINFER_BIN = process.env.PARINFER_RUST_BIN ?? "parinfer-rust"
@@ -91,17 +95,16 @@ function banner(title: string, body: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// parinfer-rust JSON IO
+// parinfer-rust paren mode
 //
-// Two-phase analysis: check mode verifies structural balance without
-// rewriting. Only genuinely unbalanced files are sent through smart
-// mode for repair. This prevents unnecessary rewrites of balanced
-// code (which caused the cond-> corruption bug).
+// Single-phase analysis: paren mode verifies structural balance and
+// corrects indentation to match bracket structure. It never adds,
+// removes, or moves brackets — only adjusts whitespace.
 
 type ParinferResult =
-  | { kind: "clean" }                          // structurally valid (check passed; no rewrite)
-  | { kind: "fixed"; corrected: string }       // check failed; smart mode rebalanced it
-  | { kind: "unfixable"; error: string }       // input has an error parinfer cannot repair
+  | { kind: "clean" }                                  // balanced, indentation matches
+  | { kind: "indentation-fixed"; corrected: string }   // balanced, indentation was corrected
+  | { kind: "unfixable"; error: string }               // structural error parinfer cannot handle
 
 type ParinferRawResult = {
   text: string
@@ -114,49 +117,10 @@ type ParinferRawResult = {
   }
 }
 
-function parinferCheck(input: string): { success: boolean; error?: string } {
-  const payload = JSON.stringify({
-    text: input,
-    mode: "check",
-    options: {},
-  })
-
-  const r = spawnSync(
-    PARINFER_BIN,
-    ["--input-format=json", "--output-format=json"],
-    { input: payload, encoding: "utf8", timeout: 8000 },
-  )
-
-  if (r.error || r.status !== 0) {
-    const detail = (r.stderr ?? "").toString().trim() ||
-      (r.error?.message ?? "parinfer-rust exited non-zero")
-    return { success: false, error: `parinfer-rust invocation failed: ${detail}` }
-  }
-
-  let parsed: ParinferRawResult
-  try {
-    parsed = JSON.parse(r.stdout)
-  } catch (e) {
-    return {
-      success: false,
-      error: `parinfer-rust returned non-JSON output: ${(e as Error).message}`,
-    }
-  }
-
-  return { success: parsed.success }
-}
-
 function parinferAnalyze(input: string): ParinferResult {
-  // Phase 1: Check if structurally valid (no rewrites needed)
-  const check = parinferCheck(input)
-  if (check.success) {
-    return { kind: "clean" }
-  }
-
-  // Phase 2: File is unbalanced — run smart mode to repair
   const payload = JSON.stringify({
     text: input,
-    mode: PARINFER_MODE,
+    mode: "paren",
     options: {},
   })
 
@@ -195,7 +159,7 @@ function parinferAnalyze(input: string): ParinferResult {
 
   return parsed.text === input
     ? { kind: "clean" }
-    : { kind: "fixed", corrected: parsed.text }
+    : { kind: "indentation-fixed", corrected: parsed.text }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +216,7 @@ export default (async () => {
 
       const result = parinferAnalyze(current)
 
-      // ----- Case 1: clean parse, file is balanced. ---------------------
+      // ----- Case 1: clean — balanced and indentation matches. ----------
       if (result.kind === "clean") {
         if (!prevWasHealthy) {
           output.output = (output.output ?? "") + banner(
@@ -263,25 +227,30 @@ export default (async () => {
         return
       }
 
-      // ----- Case 2: parinfer rebalanced. Write the corrected text. ----
-      if (result.kind === "fixed") {
+      // ----- Case 2: indentation adjusted. Write corrected text. --------
+      if (result.kind === "indentation-fixed") {
         const wrote = writeSafe(filePath, result.corrected)
         if (!wrote) {
-          // Couldn't write the correction; treat as unfixable.
           handleUnfixable(filePath, existed, prevContent, output,
-            `parinfer corrected the file but the corrected content could not be written to disk`)
+            `parinfer corrected indentation but could not write the result to disk`)
           return
         }
         const msg =
-          `Your edit to ${filePath} produced an unbalanced file. ` +
-          `parinfer-rust (${PARINFER_MODE} mode) rebalanced it automatically.\n\n` +
-          `REVIEW THE DIFF. Parinfer's correction may not match your intent. ` +
-          `Run \`git diff -- "${filePath}"\` and verify.`
-        output.output = (output.output ?? "") + banner("AUTO-FIXED via parinfer-rust", msg)
+          `Your edit to ${filePath} has balanced brackets, but the indentation ` +
+          `did not match the bracket structure. Paren mode adjusted the ` +
+          `indentation to reflect the actual nesting.\n\n` +
+          `This MAY indicate that your brackets don't match your intent ` +
+          `(e.g. a closing paren is in the wrong place).\n\n` +
+          `Run \`git diff -- "${filePath}"\` to verify the result is correct.\n\n` +
+          `If the brackets are wrong, fix the INDENTATION to express your ` +
+          `intended nesting, then run:\n` +
+          `  clj-parinfer-fix.sh "${filePath}" indent\n` +
+          `to infer correct brackets from the indentation.`
+        output.output = (output.output ?? "") + banner("INDENTATION ADJUSTED", msg)
         return
       }
 
-      // ----- Case 3: parinfer reports a structural error it can't fix. -
+      // ----- Case 3: unfixable structural error. Revert. ----------------
       handleUnfixable(filePath, existed, prevContent, output, result.error)
     },
   }
@@ -309,7 +278,7 @@ function handleUnfixable(
 
   const msg =
     `Your edit to ${filePath} produced an unparseable file and ` +
-    `parinfer-rust could not repair it.\n\n` +
+    `parinfer-rust could not process it.\n\n` +
     `Parser error: ${parinferError}\n\n` +
     (reverted
       ? `The file has been REVERTED to its pre-edit state.`
@@ -318,6 +287,8 @@ function handleUnfixable(
     `  1. Read the file — confirm what is actually there now\n` +
     `  2. If the structural change is large, replace the WHOLE top-level form, not a slice\n` +
     `  3. Errors like "unclosed-quote" or "unmatched-close-paren" inside ` +
-       `strings or reader macros are NOT bracket-balance issues — fix them by hand`
+       `strings or reader macros are NOT bracket-balance issues — fix them by hand\n` +
+    `  4. To repair bracket balance: fix the indentation to express your intended\n` +
+    `     nesting, then run: clj-parinfer-fix.sh "${filePath}" indent`
   output.output = (output.output ?? "") + banner("EDIT REVERTED", msg)
 }

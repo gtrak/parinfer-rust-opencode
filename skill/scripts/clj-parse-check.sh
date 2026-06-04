@@ -44,10 +44,10 @@ build_payload() {
     python3 -c '
 import json, sys
 src = sys.stdin.read()
-print(json.dumps({"text": src, "mode": "smart", "options": {}}))
+print(json.dumps({"text": src, "mode": "paren", "options": {}}))
 ' < "$file"
   elif command -v jq >/dev/null 2>&1; then
-    jq -Rs '{text: ., mode: "smart", options: {}}' < "$file"
+    jq -Rs '{text: ., mode: "paren", options: {}}' < "$file"
   else
     echo "neither python3 nor jq available for JSON encoding" >&2
     return 4

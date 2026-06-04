@@ -20,26 +20,17 @@ catches violations.
 
 ## What the plugin does on your behalf
 
-After every edit the plugin runs the result through `parinfer-rust`, which
-serves as both verifier and fixer. There are exactly three outcomes:
+After every edit the plugin runs the result through `parinfer-rust` in
+**paren mode**. Paren mode treats brackets as authoritative — it never
+adds, removes, or moves brackets. It only adjusts indentation to match
+the bracket structure. There are exactly four outcomes:
+
 | Banner                                          | What happened                                       | What you do                                         |
 |-------------------------------------------------|-----------------------------------------------------|-----------------------------------------------------|
-| (silent)                                        | Edit produced a structurally valid file. Check mode confirmed balance; no rewrite needed.   | Continue.                                           |
-| `AUTO-FIXED via parinfer-rust`                  | File was imbalanced; parinfer rebalanced it on disk. | Run `git diff` to confirm parinfer's repair matches your intent. |
-| `EDIT REVERTED`                                 | Parinfer reported a structural error it cannot fix (unterminated string, malformed reader macro, etc.). File rolled back to pre-edit state. | Read the file. Replace the whole top-level form. Do **not** retry the same edit. |
-| `PRE-EXISTING BREAKAGE FIXED`                   | The file had an unfixable structural error before your edit, and your edit cleared it. | Continue. |
-
-## Known issues and workarounds
-
-### cljfmt vs parinfer indentation conflict
-
-`cljfmt` (and Clojure community convention) indents `cond->` clauses to align with the initial expression's first argument column. This is valid and conventional Clojure, but parinfer's indent-based heuristics cannot distinguish `cond->` clauses from map continuations when they share the same indentation column.
-
-**Impact:** In older versions of this plugin (before the check-mode gate), editing a `cond->` form with a multi-line map literal could cause parinfer to move the map's closing `}` past subsequent clauses, silently corrupting runtime semantics.
-
-**Resolution:** The plugin now uses `check` mode as a gate. Balanced files are never rewritten. Only genuinely unbalanced files trigger smart-mode repair. If you are using an older parinfer-rust that lacks `check` mode, update to the latest version.
-
-**Manual workaround (if needed):** If you must use an older version, outdent `cond->` clauses by one column relative to the map keys so parinfer treats them as siblings rather than map continuations. Note that `cljfmt` will re-indent them on save, recreating the conflict.
+| (silent)                                        | Brackets are balanced and indentation matches structure. | Continue.                                           |
+| `INDENTATION ADJUSTED`                          | Brackets are balanced but indentation didn't match structure. Paren mode corrected the indentation on disk. | Run `git diff` to verify the bracket structure matches your intent. If brackets are wrong, see repair flow below. |
+| `EDIT REVERTED`                                 | Parinfer reported a structural error it cannot process (unterminated string, unclosed paren, malformed reader macro, etc.). File rolled back to pre-edit state. | Read the file. Replace the whole top-level form. Do **not** retry the same edit. |
+| `PRE-EXISTING BREAKAGE FIXED`                   | The file had a structural error before your edit, and your edit cleared it. | Continue. |
 
 ## Hard prohibitions
 
@@ -62,6 +53,7 @@ These apply to your behavior; the plugin enforces some of them but not all.
   variation of the same edit; investigate first.
 - **Never silently retry a failed structural edit.** If the plugin reverted
   your last edit, investigate what's wrong first. Ask the user if unsure.
+
 ## Edit pipeline
 
 For any edit to a Lisp file:
@@ -71,13 +63,37 @@ For any edit to a Lisp file:
 2. Save the edit through the normal `write` / `edit` / `hashedit` tools.
 3. **Read the plugin's banner** (or its absence) in the tool output.
    - Silent: continue.
-   - `AUTO-FIXED`: run `git diff` to confirm parinfer's correction matches
-     intent before continuing.
-   - Any other banner: stop and follow the recovery flow below.
+   - `INDENTATION ADJUSTED`: run `git diff` to verify the bracket
+     structure matches your intent. If brackets are in the wrong place,
+     follow the repair flow below.
+   - `EDIT REVERTED`: stop and follow the recovery flow below.
 
 Do not run the recovery scripts as part of this normal pipeline. The plugin
 already invokes parinfer once per edit; running it again by hand is wasted
 work.
+
+## Repair: when brackets don't match intent
+
+You reach this flow when either:
+- The plugin emitted `INDENTATION ADJUSTED` and `git diff` shows brackets
+  are in the wrong place, OR
+- You realize after the fact that nesting is wrong.
+
+The repair strategy is **indent mode** — it infers correct brackets from
+indentation. To use it:
+
+1. Edit the file so that the **indentation** expresses your intended
+   nesting. Get the indentation right; don't worry about brackets.
+2. Run the repair script:
+   ```
+   clj-parinfer-fix.sh PATH indent
+   ```
+   This rewrites brackets to match the indentation.
+3. Verify with `git diff` that the result is correct.
+
+Indent mode is powerful but requires correct indentation as input. If your
+indentation is wrong, indent mode will infer wrong brackets. Always fix
+indentation first, then run indent mode.
 
 ## Recovery: when an edit was reverted
 
@@ -103,6 +119,7 @@ You only reach this flow when the plugin has emitted `EDIT REVERTED`.
    (`unclosed-quote`, malformed `#?(...)`, etc.), parinfer cannot help.
    The bug is almost always a stray `"` or a typo in a reader form. Fix
    it manually with a whole-form replacement.
+
 ## Reader-error triage cheat sheet
 
 If you do see a reader error directly (e.g. from kondo, or from running
@@ -110,24 +127,27 @@ code outside the plugin's coverage):
 
 | Error                                | First action                                          |
 |--------------------------------------|-------------------------------------------------------|
-| Unmatched delimiter: `)`             | Edit through the plugin — parinfer will rebalance     |
-| Unmatched bracket: unexpected `)`    | Edit through the plugin — parinfer will rebalance     |
+| Unmatched delimiter: `)`             | Edit through the plugin — paren mode will catch it    |
+| Unmatched bracket: unexpected `)`    | Edit through the plugin — paren mode will catch it    |
 | EOF while reading                    | Likely missing `)` or `"` — `git diff HEAD --`        |
 | EOF while reading string             | Unterminated string — scan for stray `"`              |
 | `unclosed-quote` (parinfer)          | Unterminated string — fix manually                    |
+| `unclosed-paren` (parinfer)          | Missing close paren — fix indentation + indent mode   |
 | Invalid token                        | Reader macro problem; parinfer **cannot** help        |
 | Unable to resolve symbol             | Not structural — ignore for this skill                |
 
 ## Bundled scripts (for manual recovery only)
 
-- `scripts/clj-parse-check.sh PATH` — exit 0 if `parinfer-rust` accepts
-  the file as structurally sound. Useful when you want to triage a file
-  outside an opencode session.
+- `scripts/clj-parse-check.sh PATH` — exit 0 if `parinfer-rust` (paren
+  mode) accepts the file as structurally balanced. Useful when you want to
+  triage a file outside an opencode session.
 - `scripts/clj-parinfer-fix.sh PATH [smart|paren|indent]` — runs
-  `parinfer-rust` on the file in place. Default mode is `smart`.
+  `parinfer-rust` on the file in place. Use `indent` mode to infer
+  brackets from indentation (the recommended repair strategy).
 
-The plugin already runs the equivalent of both inside opencode. Reach for
-these scripts only when triaging from a regular shell.
+The plugin already runs paren mode inside opencode. Reach for these scripts
+only when triaging from a regular shell or when performing indent-mode
+repair.
 
 ## Why this exists
 
@@ -137,8 +157,9 @@ failed attempt adds another broken file state to the context, which makes
 the next attempt more likely to fail too.
 
 Taking the structural problem out of the model's hands is the only stable
-path. Parinfer balances brackets correctly. Parinfer's parser knows what
-is and isn't a valid s-expression tree. The plugin wires both jobs into
-the tool pipeline so a broken file cannot survive a round-trip. The skill
-is just the model-facing explanation of what the plugin is doing and how
-to react to it.
+path. Parinfer's paren mode validates bracket structure without ever
+silently rewriting brackets. When brackets are wrong, indent mode lets the
+agent express intent through indentation and have brackets inferred
+correctly. The plugin wires paren-mode validation into the tool pipeline so
+a broken file cannot survive a round-trip. The skill is just the
+model-facing explanation of what the plugin is doing and how to react to it.

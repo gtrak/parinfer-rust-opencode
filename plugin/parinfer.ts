@@ -1,4 +1,4 @@
-// clojure-structural-edit — opencode plugin
+// parinfer — opencode plugin
 //
 // Enforces structural integrity of Clojure / EDN / Lisp-family files
 // across `write`, `edit`, and `hashedit` tool calls.
@@ -22,17 +22,25 @@
 //     structure. Paren mode's corrected indentation is written to disk
 //     and a warning banner tells the agent to verify intent.
 //
+// Indent mode (via the `parinfer-indent-mode` custom tool):
+//
+//   When the agent is writing new forms or retrying after a revert, it
+//   can arm indent mode by calling the `parinfer-indent-mode` tool. The
+//   next Clojure file edit will run parinfer in indent mode first (which
+//   infers brackets from indentation), then verifies with paren mode.
+//   This lets LLMs write code with correct indentation without needing
+//   to track every closing bracket perfectly.
+//
 // Hook surface (opencode 1.4.x):
 //   - tool.execute.before  : snapshot pre-edit content + health
 //   - tool.execute.after   : analyse the post-edit content via parinfer;
 //                            silently accept, write corrected indentation
 //                            and warn, or revert from snapshot.
 //
-// The plugin observes; opencode 1.4 cannot truly block a tool call. The
-// edit hits disk, then the plugin reacts. Banners are appended to the
-// tool's `output.output` so the agent sees them in-band.
+// Custom tool:
+//   - parinfer-indent-mode : arms indent mode for the next Clojure edit
 //
-import type { Plugin } from "@opencode-ai/plugin"
+import { type Plugin, tool } from "@opencode-ai/plugin"
 import { spawnSync } from "node:child_process"
 import { readFileSync, writeFileSync, statSync, unlinkSync } from "node:fs"
 import { extname, isAbsolute, resolve } from "node:path"
@@ -61,6 +69,10 @@ type Snapshot = {
 
 // Keyed by callID — opencode passes the same callID to before/after.
 const snapshots = new Map<string, Snapshot>()
+
+// Global one-shot flag: when true, the next Clojure file edit uses indent
+// mode to infer brackets from indentation before verifying with paren mode.
+let useIndentMode = false
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -91,15 +103,15 @@ function exists(path: string): boolean {
 
 function banner(title: string, body: string): string {
   const bar = "=".repeat(72)
-  return `\n${bar}\n[clojure-structural-edit] ${title}\n${bar}\n${body}\n${bar}\n`
+  return `\n${bar}\n[parinfer] ${title}\n${bar}\n${body}\n${bar}\n`
 }
 
 // ---------------------------------------------------------------------------
 // parinfer-rust paren mode
 //
-// Single-phase analysis: paren mode verifies structural balance and
-// corrects indentation to match bracket structure. It never adds,
-// removes, or moves brackets — only adjusts whitespace.
+// Verifies structural balance and corrects indentation to match bracket
+// structure. Never adds, removes, or moves brackets — only adjusts
+// whitespace.
 
 type ParinferResult =
   | { kind: "clean" }                                  // balanced, indentation matches
@@ -131,8 +143,6 @@ function parinferAnalyze(input: string): ParinferResult {
   )
 
   if (r.error || r.status !== 0) {
-    // parinfer-rust missing, crashed, or refused the input. Treat as
-    // unfixable so the plugin reverts; surface stderr for debugging.
     const detail = (r.stderr ?? "").toString().trim() ||
       (r.error?.message ?? "parinfer-rust exited non-zero")
     return { kind: "unfixable", error: `parinfer-rust invocation failed: ${detail}` }
@@ -163,16 +173,65 @@ function parinferAnalyze(input: string): ParinferResult {
 }
 
 // ---------------------------------------------------------------------------
+// parinfer-rust indent mode
+//
+// Infers correct brackets from indentation. Used when the agent arms
+// indent mode via the custom tool before writing new/large forms.
+
+type ParinferIndentResult =
+  | { kind: "success"; text: string }
+  | { kind: "error"; error: string }
+
+function parinferIndent(input: string): ParinferIndentResult {
+  const payload = JSON.stringify({
+    text: input,
+    mode: "indent",
+    options: {},
+  })
+
+  const r = spawnSync(
+    PARINFER_BIN,
+    ["--input-format=json", "--output-format=json"],
+    { input: payload, encoding: "utf8", timeout: 8000 },
+  )
+
+  if (r.error || r.status !== 0) {
+    const detail = (r.stderr ?? "").toString().trim() ||
+      (r.error?.message ?? "parinfer-rust exited non-zero")
+    return { kind: "error", error: `parinfer-rust invocation failed: ${detail}` }
+  }
+
+  let parsed: ParinferRawResult
+  try {
+    parsed = JSON.parse(r.stdout)
+  } catch (e) {
+    return {
+      kind: "error",
+      error: `parinfer-rust returned non-JSON output: ${(e as Error).message}`,
+    }
+  }
+
+  if (!parsed.success) {
+    const err = parsed.error
+    const loc = err && typeof err.lineNo === "number"
+      ? ` [line ${err.lineNo + 1}, col ${(err.x ?? 0) + 1}]`
+      : ""
+    const msg = err ? `${err.name}: ${err.message}${loc}` : "(no detail)"
+    return { kind: "error", error: msg }
+  }
+
+  return { kind: "success", text: parsed.text }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin
 
 export default (async () => {
-  // Probe parinfer-rust at load time and warn loudly if missing. We don't
-  // disable the plugin — a clear runtime banner is more useful than silent
-  // no-op behavior, since the agent will read the banner and react.
+  // Probe parinfer-rust at load time and warn loudly if missing.
   const probe = spawnSync(PARINFER_BIN, ["--help"], { timeout: 4000 })
   if (probe.error || probe.status !== 0) {
     console.warn(
-      `[clojure-structural-edit] cannot find parinfer-rust binary "${PARINFER_BIN}". ` +
+      `[parinfer] cannot find parinfer-rust binary "${PARINFER_BIN}". ` +
       `Install with \`cargo install parinfer-rust\` or set PARINFER_RUST_BIN. ` +
       `Until then every Clojure edit will be reverted with a "parinfer-rust ` +
       `invocation failed" banner.`,
@@ -180,6 +239,28 @@ export default (async () => {
   }
 
   return {
+    tool: {
+      "parinfer-indent-mode": tool({
+        description:
+          "Arm parinfer indent mode for the next Clojure/Lisp file edit. " +
+          "Call this BEFORE writing any new top-level form (defn, deftest, def, ns, etc.) " +
+          "or when retrying after an EDIT REVERTED banner. " +
+          "The next write/edit/hashedit to any Clojure file will infer brackets from " +
+          "indentation instead of rejecting unbalanced brackets. " +
+          "Your code must have correct indentation — indent mode trusts it absolutely.",
+        args: {},
+        async execute(_args, _context) {
+          useIndentMode = true
+          return (
+            "Indent mode armed.\n\n" +
+            "The next edit to any Clojure/Lisp file will use parinfer indent mode " +
+            "to infer brackets from indentation. Write your code with correct " +
+            "indentation — closing brackets don't need to be perfect."
+          )
+        },
+      }),
+    },
+
     "tool.execute.before": async (input, output) => {
       if (!TARGET_TOOLS.has(input.tool)) return
       const filePath = extractFilePath(input.tool, output.args)
@@ -214,6 +295,41 @@ export default (async () => {
       const current = readSafe(filePath)
       if (current === null) return
 
+      // ----- Indent mode path (one-shot) --------------------------------
+      if (useIndentMode) {
+        useIndentMode = false
+
+        const indentResult = parinferIndent(current)
+        if (indentResult.kind === "error") {
+          handleUnfixable(filePath, existed, prevContent, output, indentResult.error)
+          return
+        }
+
+        // Write indent-mode output to disk
+        const wrote = writeSafe(filePath, indentResult.text)
+        if (!wrote) {
+          handleUnfixable(filePath, existed, prevContent, output,
+            "parinfer indent mode succeeded but could not write the result to disk")
+          return
+        }
+
+        // Verify with paren mode (should always pass — indent mode produces balanced output)
+        const verify = parinferAnalyze(indentResult.text)
+        if (verify.kind === "unfixable") {
+          handleUnfixable(filePath, existed, prevContent, output, verify.error)
+          return
+        }
+
+        output.output = (output.output ?? "") + banner(
+          "INDENT MODE APPLIED",
+          `Parinfer indent mode inferred brackets from indentation for ${filePath}.\n` +
+          `Run \`git diff -- "${filePath}"\` to verify the result is correct.\n` +
+          `If the nesting is wrong, fix the indentation of the affected sub-form and re-edit.`,
+        )
+        return
+      }
+
+      // ----- Standard paren mode path -----------------------------------
       const result = parinferAnalyze(current)
 
       // ----- Case 1: clean — balanced and indentation matches. ----------
@@ -284,11 +400,13 @@ function handleUnfixable(
       ? `The file has been REVERTED to its pre-edit state.`
       : `WARNING: revert FAILED. The file is in a broken state on disk.`) +
     `\n\nDo NOT retry the same edit. Required next steps:\n` +
-    `  1. Read the file — confirm what is actually there now\n` +
+    `  1. If your code has correct indentation but wrong/missing brackets:\n` +
+    `     Call parinfer-indent-mode then retry the edit.\n` +
+    `     Indent mode will infer correct brackets from your indentation.\n` +
     `  2. If the structural change is large, replace the WHOLE top-level form, not a slice\n` +
     `  3. Errors like "unclosed-quote" or "unmatched-close-paren" inside ` +
        `strings or reader macros are NOT bracket-balance issues — fix them by hand\n` +
-    `  4. To repair bracket balance: fix the indentation to express your intended\n` +
+    `  4. To repair bracket balance manually: fix the indentation to express your intended\n` +
     `     nesting, then run: clj-parinfer-fix.sh "${filePath}" indent`
   output.output = (output.output ?? "") + banner("EDIT REVERTED", msg)
 }

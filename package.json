@@ -3,10 +3,10 @@
   "version": "0.1.0",
   "description": "An opencode plugin and skill that enforces structural integrity of Clojure / EDN / Lisp-family files via parinfer-rust. Stops LLMs from paren-counting their way into broken s-expressions.",
   "type": "module",
-  "main": "plugin/clojure-structural-edit.ts",
+  "main": "plugin/parinfer.ts",
   "exports": {
-    ".": "./plugin/clojure-structural-edit.ts",
-    "./plugin": "./plugin/clojure-structural-edit.ts",
+    ".": "./plugin/parinfer.ts",
+    "./plugin": "./plugin/parinfer.ts",
     "./skill": "./skill/SKILL.md"
   },
   "files": [
@@ -16,7 +16,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit --target esnext --module esnext --moduleResolution bundler --strict --skipLibCheck --types node plugin/clojure-structural-edit.ts"
+    "typecheck": "tsc --noEmit --target esnext --module esnext --moduleResolution bundler --strict --skipLibCheck --types node plugin/parinfer.ts"
   },
   "keywords": [
     "opencode",

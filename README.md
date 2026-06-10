@@ -24,7 +24,7 @@ the agent sees. The agent reads them in-band and adjusts.
 ## What's in the box
 
 ```
-plugin/clojure-structural-edit.ts   the opencode plugin
+plugin/parinfer.ts                  the opencode plugin
 skill/SKILL.md                      rules of engagement (loaded as an opencode skill)
 skill/scripts/clj-parse-check.sh    parinfer-as-verifier wrapper (manual recovery)
 skill/scripts/clj-parinfer-fix.sh   parinfer-rust in-place fix (manual recovery)
@@ -58,7 +58,7 @@ Then in your `~/.config/opencode/opencode.json`:
 ```jsonc
 {
   "plugin": [
-    "file:///home/YOU/dev/parinfer-rust-opencode/plugin/clojure-structural-edit.ts"
+    "file:///home/YOU/dev/parinfer-rust-opencode/plugin/parinfer.ts"
   ],
   "skills": {
     "paths": ["/home/YOU/dev/parinfer-rust-opencode/skill"]
@@ -78,7 +78,7 @@ Then in `opencode.json`:
 ```jsonc
 {
   "plugin": [
-    "file:///home/YOU/.config/opencode/node_modules/parinfer-rust-opencode/plugin/clojure-structural-edit.ts"
+    "file:///home/YOU/.config/opencode/node_modules/parinfer-rust-opencode/plugin/parinfer.ts"
   ],
   "skills": {
     "paths": ["/home/YOU/.config/opencode/node_modules/parinfer-rust-opencode/skill"]
@@ -94,8 +94,8 @@ auto-loads any skill in `~/.config/opencode/skills/<name>/SKILL.md`. So you
 can also symlink or copy:
 
 ```bash
-ln -s ~/dev/parinfer-rust-opencode/plugin/clojure-structural-edit.ts \
-      ~/.config/opencode/plugin/clojure-structural-edit.ts
+ln -s ~/dev/parinfer-rust-opencode/plugin/parinfer.ts \
+      ~/.config/opencode/plugin/parinfer.ts
 ln -s ~/dev/parinfer-rust-opencode/skill \
       ~/.config/opencode/skills/clojure-parinfer
 ```
@@ -121,7 +121,7 @@ Environment variables:
 - `PARINFER_RUST_BIN` — override the path to the parinfer-rust binary
   (default: `parinfer-rust`, looked up on `PATH`).
 
-Constants you can tweak by editing `plugin/clojure-structural-edit.ts`:
+Constants you can tweak by editing `plugin/parinfer.ts`:
 
 - `PARINFER_MODE` (default `"smart"`) — `"smart"`, `"paren"`, or `"indent"`.
 - `TARGET_TOOLS` — which opencode tools the plugin intercepts.
